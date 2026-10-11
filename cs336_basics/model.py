@@ -4,13 +4,17 @@ from torch import nn
 class Linear(nn.Module):
     def __init__(self, d_in: int, d_out: int):
         super().__init__()
-
+        # torch.empty() 分配一块内存，但暂时不做初始化
+        # nn.Parameter(...) 告诉 nn.model 这是模型需要管理和训练的参数
         self.weight = nn.Parameter(torch.empty(d_out, d_in))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # y=xW^T
         return x @ self.weight.T
 
+# 把 tokenID 变成一个向量
 class Embedding(nn.Module):
+    # vocab_size 表示词表大小（tokenizer 总计定义了多少个 token，d_model 表示每个 token 的向量维度
     def __init__(self, vocab_size: int, d_model: int):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(vocab_size, d_model))
@@ -22,27 +26,30 @@ class SiLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(x)
 
+# 把一个 token 的隐藏向量做归一化，让数值尺度更稳定
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
+        # torch.ones()：创建一个元素全为1的 Tensor
         self.weight = nn.Parameter(torch.ones(d_model))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # dim=-1：沿最后一个维度计算 keepdim=True：保持 shape 更规整，方便后续广播运算
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
         return x / rms * self.weight
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_ff: int):
         super().__init__()
-        self.w1 = Linear(d_model, d_ff)
-        self.w2 = Linear(d_ff, d_model)
-        self.w3 = Linear(d_model, d_ff)
-
-        self.silu = SiLU()
+        self.w1 = Linear(d_model, d_ff) # 升维
+        self.w2 = Linear(d_ff, d_model) # 降维
+        self.w3 = Linear(d_model, d_ff) # 升维
+        self.silu = SiLU() # 创建一个 SiLU 激活函数 SiLU(x)=xσ(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(self.silu(self.w1(x)) * self.w3(x))
+        return self.w2(self.silu(self.w1(x)) * self.w3(x)) # * 就是逐元素相乘 ⊙
+        # nn.Module 的对象可以像函数一样调用，这是因为 Pytorch 的 nn.Module 实现了 __call__()，比较类似于 C++ 中的 operator()
 
 def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
     d_k = Q.shape[-1] # shape[-1] 就是取 Tensor 最后一个维度
@@ -61,34 +68,40 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
 class RoPE(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int):
         super().__init__()
-        self.theta = theta
-        self.d_k = d_k
+        self.theta = theta # 控制不同维度组 ⌈转得多快⌋ 的一个超参数
+        self.d_k = d_k # d_k 是每个 head 的维度：d_k=d_model/head_num
         self.max_seq_len = max_seq_len
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
-        # 1. 计算每一对维度的旋转频率
+        # 1. 计算每一对维度的旋转频率 w_i=Θ^(-2i/d_k)
         freq = self.theta ** (-torch.arange(0, self.d_k, 2, device=x.device, dtype=x.dtype) / self.d_k)
+        # torch.arange(start, end, step) 是 PyTorch 里生成等差序列张量的函数，这里是在取每一组二维维度的第一个下标
 
-        # 2. 每个 token 的位置 × 频率 = 旋转角
-        angles = token_positions[..., None] * freq
+        # 2. 旋转角 = 每个 token 的位置 * 频率
+        angles = token_positions[..., None] * freq # ... 表示前面的所有维度都保留    None 表示插入一个长度为1的新维度
+        # 这里 token_positions[..., None] 是通过增加一个维度，把 token_positions 从横着变成竖着
+        # 假设此时 token_positions 维度 [4, 1]，freq 维度是 [3]，最终两者都会被广播成 [4, 3]
+        # PyTorch 的广播规则：
+        # - 从最后一个维度开始比较。
+        # - 两个维度满足以下任意一个，就能广播：
+        #    - 两者相等
+        #    - 其中一个是 1
+        #    - 某一边没有这个维度，默认当成 1
 
         # 3. 计算旋转需要的 sin / cos
         cos = torch.cos(angles)
         sin = torch.sin(angles)
-
         # 4. 把维度两两拆开
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-
+        # ... 前面的所有维度都保留，只对最后一维进行切片
+        x_even = x[..., 0::2] # 偶数切片 从下标 0 开始，一直到最后，每隔 2 个取一个
+        x_odd = x[..., 1::2]  # 奇数切片 从下标 1 开始，一直到最后，每隔 2 个取一个
         # 5. 二维旋转
         out_even = x_even * cos - x_odd * sin
         out_odd = x_even * sin + x_odd * cos
-
         # 6. 再交叉放回原来的维度
-        out = torch.empty_like(x)
+        out = torch.empty_like(x) # 先创建一个跟 x：shape 一样，dtype 一样，device 一样的 Tensor
         out[..., 0::2] = out_even
         out[..., 1::2] = out_odd
-
         return out
 
 class MultiHeadSelfAttention(nn.Module):
