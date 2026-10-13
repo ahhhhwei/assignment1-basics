@@ -1,4 +1,5 @@
 import torch
+import math
 from torch import nn
 
 class Linear(nn.Module):
@@ -7,6 +8,8 @@ class Linear(nn.Module):
         # torch.empty() 分配一块内存，但暂时不做初始化
         # nn.Parameter(...) 告诉 nn.model 这是模型需要管理和训练的参数
         self.weight = nn.Parameter(torch.empty(d_out, d_in))
+        std = math.sqrt(2 / (d_in + d_out))
+        nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # y=xW^T
@@ -60,7 +63,8 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     scores = Q @ K.transpose(-2, -1)
     scores = scores / (d_k ** 0.5)
     if mask is not None:
-        scores = scores.masked_fill(~mask, float("-inf"))
+        # mask 为 False 的地方，把 score 改成负无穷（e^(-∞)=0）
+        scores = scores.masked_fill(~mask, float("-inf")) # ~mask 表示布尔取反
     attention_weights = torch.softmax(scores, dim=-1)
     return attention_weights @ V
 
@@ -107,7 +111,6 @@ class RoPE(nn.Module):
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int):
         super().__init__()
-
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
@@ -124,12 +127,12 @@ class MultiHeadSelfAttention(nn.Module):
         V = self.v_proj(x)
 
         # 把 d_model 拆成 num_heads × d_k
-        Q = Q.unflatten(-1, (self.num_heads, self.d_k))
+        Q = Q.unflatten(-1, (self.num_heads, self.d_k)) # 把最后一个维度按照 num_heads × d_k 的方式拆开
         K = K.unflatten(-1, (self.num_heads, self.d_k))
         V = V.unflatten(-1, (self.num_heads, self.d_k))
 
         # (..., seq_len, heads, d_k)
-        # →
+        # → 倒数第二个和倒数第三个维度交换 对应 scaled_dot_product_attention 的输入
         # (..., heads, seq_len, d_k)
         Q = Q.transpose(-3, -2)
         K = K.transpose(-3, -2)
@@ -141,7 +144,7 @@ class MultiHeadSelfAttention(nn.Module):
         # token0 只能看 token0
         # token1 可以看 token0 token1
         # token2 可以看 token0 token1 token2
-        mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
+        mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device)) # device=x.device 让新创建的 Tensor 放到和 x 一样的设备上
         output = scaled_dot_product_attention(Q, K, V, mask)
         # (..., heads, seq_len, d_k)
         # →
@@ -153,193 +156,94 @@ class MultiHeadSelfAttention(nn.Module):
         return self.output_proj(output)
 
 class MultiHeadSelfAttentionWithRoPE(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        max_seq_len: int,
-        theta: float,
-    ):
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float):
         super().__init__()
-
         self.d_model = d_model
         self.num_heads = num_heads
-
         # 每个 head 中 Q/K 的维度
         self.d_k = d_model // num_heads
-
         # 生成 Q、K、V 的线性层
         self.q_proj = Linear(d_model, d_model)
         self.k_proj = Linear(d_model, d_model)
         self.v_proj = Linear(d_model, d_model)
-
         # 多头 Attention 做完之后的输出投影
         self.output_proj = Linear(d_model, d_model)
-
         # RoPE
-        self.rope = RoPE(
-            theta=theta,
-            d_k=self.d_k,
-            max_seq_len=max_seq_len,
-        )
+        self.rope = RoPE(theta=theta, d_k=self.d_k, max_seq_len=max_seq_len)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        token_positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
         # ① 生成 Q、K、V
         Q = self.q_proj(x)
         K = self.k_proj(x)
         V = self.v_proj(x)
-
         # ② 把 d_model 拆成 num_heads × d_k
         Q = Q.unflatten(-1, (self.num_heads, self.d_k))
         K = K.unflatten(-1, (self.num_heads, self.d_k))
         V = V.unflatten(-1, (self.num_heads, self.d_k))
-
         # (..., seq_len, heads, d_k)
         # →
         # (..., heads, seq_len, d_k)
         Q = Q.transpose(-3, -2)
         K = K.transpose(-3, -2)
         V = V.transpose(-3, -2)
-
         seq_len = x.shape[-2]
-
         # ③ 如果没有提供位置，就默认 0,1,2,...,seq_len-1
         if token_positions is None:
-            token_positions = torch.arange(
-                seq_len,
-                device=x.device,
-            )
-
+            token_positions = torch.arange(seq_len, device=x.device)
         # 为 head 这个维度补一个维度，方便广播
         while token_positions.ndim < Q.ndim - 1:
             token_positions = token_positions.unsqueeze(-2)
-
         # ④ 只给 Q、K 做 RoPE
         Q = self.rope(Q, token_positions)
         K = self.rope(K, token_positions)
-
         # ⑤ causal mask：不能看未来 token
-        mask = torch.tril(
-            torch.ones(
-                seq_len,
-                seq_len,
-                dtype=torch.bool,
-                device=x.device,
-            )
-        )
-
+        mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
         # ⑥ 每个 head 做 Attention
-        output = scaled_dot_product_attention(
-            Q,
-            K,
-            V,
-            mask,
-        )
-
+        output = scaled_dot_product_attention(Q, K, V, mask)
         # ⑦ 把 head 移回去
         output = output.transpose(-3, -2)
-
         # ⑧ num_heads × d_k → d_model
         output = output.flatten(-2)
-
         # ⑨ 输出投影
         return self.output_proj(output)
 
 class TransformerBlock(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        d_ff: int,
-        max_seq_len: int,
-        theta: float,
-    ):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float):
         super().__init__()
-
         self.ln1 = RMSNorm(d_model)
-
-        self.attn = MultiHeadSelfAttentionWithRoPE(
-            d_model=d_model,
-            num_heads=num_heads,
-            max_seq_len=max_seq_len,
-            theta=theta,
-        )
-
+        self.attn = MultiHeadSelfAttentionWithRoPE(d_model=d_model, num_heads=num_heads, max_seq_len=max_seq_len, theta=theta)
         self.ln2 = RMSNorm(d_model)
-
-        self.ffn = SwiGLU(
-            d_model=d_model,
-            d_ff=d_ff,
-        )
+        self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
         # 第一部分：Attention
         x = x + self.attn(self.ln1(x))
-
         # 第二部分：FFN
         x = x + self.ffn(self.ln2(x))
-
         return x
 
 class TransformerLM(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        context_length: int,
-        d_model: int,
-        num_layers: int,
-        num_heads: int,
-        d_ff: int,
-        rope_theta: float,
-    ):
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, num_heads: int, d_ff: int, rope_theta: float):
         super().__init__()
-
         # 1. token id -> d_model 维向量
-        self.token_embeddings = Embedding(
-            vocab_size=vocab_size,
-            d_model=d_model,
-        )
-
+        self.token_embeddings = Embedding(vocab_size=vocab_size, d_model=d_model)
         # 2. 堆叠 num_layers 个 Transformer Block
-        self.layers = nn.ModuleList([
-            TransformerBlock(
-                d_model=d_model,
-                num_heads=num_heads,
-                d_ff=d_ff,
-                max_seq_len=context_length,
-                theta=rope_theta,
-            )
-            for _ in range(num_layers)
+        self.layers = nn.ModuleList([TransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff, max_seq_len=context_length, theta=rope_theta)
+            for _ in range(num_layers) # nn.ModuleList：PyTorch Module 的列表
         ])
-
         # 3. 最后再做一次 RMSNorm
         self.ln_final = RMSNorm(d_model)
-
-        # 4. d_model -> vocab_size
-        self.lm_head = Linear(
-            d_in=d_model,
-            d_out=vocab_size,
-        )
+        # 4. d_model -> vocab_size：把语义向量和词表匹配，映射到分数
+        self.lm_head = Linear(d_in=d_model, d_out=vocab_size)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-
         # token id -> embedding
         x = self.token_embeddings(token_ids)
-
         # 依次经过所有 Transformer Block
         for layer in self.layers:
             x = layer(x)
-
         # 最终归一化
         x = self.ln_final(x)
-
-        # 映射到整个词表，得到 logits
+        # 映射到整个词表，得到 logits：只是模型打的原始分数，不是概率
         logits = self.lm_head(x)
-
         return logits

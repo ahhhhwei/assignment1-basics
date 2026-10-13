@@ -13,8 +13,7 @@ from cs336_basics.nn_utils import softmax, cross_entropy, gradient_clipping
 from cs336_basics.data import get_batch
 from cs336_basics.optimizer import AdamW, get_lr_cosine_schedule
 from cs336_basics.checkpoint import save_checkpoint, load_checkpoint
-from cs336_basics.tokenizer import train_bpe
-from cs336_basics.tokenizer import Tokenizer
+from cs336_basics.tokenizer import train_bpe, Tokenizer
 
 def run_linear(
     d_in: int,
